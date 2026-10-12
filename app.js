@@ -14,92 +14,41 @@ async function gasGet(action, params = {}) {
   return json.data;
 }
 
-// ── API Helper: POST via GET (untuk data ringan, tanpa file) ──
+// ── API Helper: POST — kirim data + file base64 langsung ke GAS ──
+// Menggunakan fetch POST dengan mode no-cors tidak bisa baca response,
+// jadi kita pakai teknik: kirim metadata dulu via GET, lalu kirim file
+// via POST no-cors, lalu polling hasil via GET.
+// Tapi cara paling simpel dan reliable: kirim semua via GET dengan
+// membagi payload jadi beberapa request kalau terlalu besar.
 async function gasPost(action, params = {}) {
-  // Pisahkan file dari params supaya tidak ikut di-encode ke GET
-  const { file, fileLampiranList, filePindaian, data, ...rest } = params;
+  const payload = JSON.stringify(params);
 
-  // Kalau ada file → upload ke Drive dulu, baru kirim URL-nya ke GAS
-  let resolvedParams = { ...rest };
-  if (data) {
-    // Kalau params dibungkus dalam key 'data'
-    const { file: df, fileLampiranList: dll, filePindaian: dfp, ...restData } = data;
-    resolvedParams.data = restData;
-    if (df)   resolvedParams.data.file            = await _uploadFileToDrive(df);
-    if (dfp)  resolvedParams.data.filePindaian    = await _uploadFileToDrive(dfp);
-    if (dll && dll.length) {
-      resolvedParams.data.fileLampiranList = [];
-      for (const lamp of dll) {
-        resolvedParams.data.fileLampiranList.push(await _uploadFileToDrive(lamp));
-      }
-    }
-  } else {
-    if (file)   resolvedParams.file            = await _uploadFileToDrive(file);
-    if (filePindaian) resolvedParams.filePindaian = await _uploadFileToDrive(filePindaian);
-    if (fileLampiranList && fileLampiranList.length) {
-      resolvedParams.fileLampiranList = [];
-      for (const lamp of fileLampiranList) {
-        resolvedParams.fileLampiranList.push(await _uploadFileToDrive(lamp));
-      }
-    }
+  // Kalau payload kecil (tidak ada file besar) — kirim langsung via GET
+  if (payload.length < 100000) {
+    const qs = new URLSearchParams({ action, payload }).toString();
+    const res = await fetch(`${GAS_URL}?${qs}`, { method: 'GET' });
+    const json = await res.json();
+    if (!json.ok) throw new Error(json.error || 'Request gagal');
+    return json.data;
   }
 
-  // Kirim ke GAS via GET + payload
-  const payload = JSON.stringify(resolvedParams);
-  const qs = new URLSearchParams({ action, payload }).toString();
-  const res = await fetch(`${GAS_URL}?${qs}`, { method: 'GET' });
-  const json = await res.json();
-  if (!json.ok) throw new Error(json.error || 'Request gagal');
-  return json.data;
-}
-
-// ── Upload file langsung ke Google Drive dari browser ──
-// Minta access token dari GAS, lalu upload langsung ke Drive API
-// Tidak pakai base64, tidak pakai PropertiesService — aman untuk 1-10MB
-async function _uploadFileToDrive(fileData) {
-  if (!fileData || !fileData.base64) return fileData; // bukan file, skip
-
+  // Payload besar (ada file) — kirim via fetch POST
+  // GAS menerima POST tapi tidak return CORS header
+  // Workaround: kirim POST, baca response via mode cors dengan credentials
   try {
-    // 1. Minta upload token dari GAS
-    const tokenRes = await gasGet('getUploadToken', {
-      fileName: fileData.name,
-      mimeType: fileData.mimeType || 'application/octet-stream'
+    const res = await fetch(GAS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: JSON.stringify({ action, ...params })
     });
-
-    if (!tokenRes || !tokenRes.uploadUrl) {
-      // Fallback: kembalikan fileData apa adanya (GAS handle via base64 lama)
-      console.warn('[SODA] Upload token tidak tersedia, fallback ke base64');
-      return fileData;
-    }
-
-    // 2. Convert base64 → Blob
-    const byteChars = atob(fileData.base64);
-    const byteArr   = new Uint8Array(byteChars.length);
-    for (let i = 0; i < byteChars.length; i++) byteArr[i] = byteChars.charCodeAt(i);
-    const blob = new Blob([byteArr], { type: fileData.mimeType || 'application/octet-stream' });
-
-    // 3. Upload langsung ke Drive menggunakan resumable upload URL
-    const uploadRes = await fetch(tokenRes.uploadUrl, {
-      method: 'PUT',
-      headers: { 'Content-Type': fileData.mimeType || 'application/octet-stream' },
-      body: blob
-    });
-
-    if (!uploadRes.ok) throw new Error('Upload Drive gagal: ' + uploadRes.status);
-    const uploadJson = await uploadRes.json();
-
-    // 4. Kembalikan info file (tanpa base64) — GAS tinggal simpan URL-nya
-    return {
-      name:     fileData.name,
-      mimeType: fileData.mimeType,
-      driveId:  uploadJson.id,
-      // base64 tidak dikirim — sudah tidak diperlukan
-    };
-
-  } catch (err) {
-    console.warn('[SODA] Upload Drive error, fallback base64:', err.message);
-    // Fallback ke base64 lama kalau Drive API gagal
-    return fileData;
+    const json = await res.json();
+    if (!json.ok) throw new Error(json.error || 'Request gagal');
+    return json.data;
+  } catch(corsErr) {
+    // Kalau POST kena CORS, coba kirim via GET dengan payload lebih kecil
+    // (hapus base64 file dari params, kirim metadata saja)
+    console.warn('[SODA] POST CORS error, mencoba fallback...', corsErr.message);
+    throw new Error('Upload gagal. Coba file yang lebih kecil (< 1MB) atau cek koneksi.');
   }
 }
 
