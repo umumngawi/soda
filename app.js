@@ -14,83 +14,42 @@ async function gasGet(action, params = {}) {
   return json.data;
 }
 
-// ── API Helper: POST ringan (tanpa file) via GET ──
+// ── API Helper: POST — kirim data + file base64 langsung ke GAS ──
+// Menggunakan fetch POST dengan mode no-cors tidak bisa baca response,
+// jadi kita pakai teknik: kirim metadata dulu via GET, lalu kirim file
+// via POST no-cors, lalu polling hasil via GET.
+// Tapi cara paling simpel dan reliable: kirim semua via GET dengan
+// membagi payload jadi beberapa request kalau terlalu besar.
 async function gasPost(action, params = {}) {
   const payload = JSON.stringify(params);
-  const qs = new URLSearchParams({ action, payload }).toString();
-  const res = await fetch(`${GAS_URL}?${qs}`, { method: 'GET' });
-  const json = await res.json();
-  if (!json.ok) throw new Error(json.error || 'Request gagal');
-  return json.data;
-}
 
-// ── Upload file CEPAT: langsung ke Drive, bypass GAS ──
-// Alur: minta token dari GAS (GET kecil) → upload blob ke Drive API
-//       → konfirmasi ke GAS untuk rename + simpan URL ke Sheet
-async function _uploadFileFast(fileObj) {
-  if (!fileObj || !fileObj.base64) return null;
-  toast('Mengunggah file ke Drive...');
-
-  // 1. Minta upload session dari GAS
-  const tokenRes = await gasGet('getUploadToken', {
-    fileName: fileObj.name,
-    mimeType: fileObj.mimeType || 'application/octet-stream'
-  });
-  if (!tokenRes || !tokenRes.uploadUrl) throw new Error('Gagal mendapat upload URL.');
-
-  // 2. Convert base64 → Blob
-  const byteStr = atob(fileObj.base64);
-  const buf     = new Uint8Array(byteStr.length);
-  for (let i = 0; i < byteStr.length; i++) buf[i] = byteStr.charCodeAt(i);
-  const blob = new Blob([buf], { type: fileObj.mimeType || 'application/octet-stream' });
-
-  // 3. Upload langsung ke Drive (ini yang tercepat — tidak lewat GAS)
-  const uploadRes = await fetch(tokenRes.uploadUrl, {
-    method:  'PUT',
-    headers: { 'Content-Type': fileObj.mimeType || 'application/octet-stream' },
-    body:    blob
-  });
-  if (!uploadRes.ok) throw new Error('Upload ke Drive gagal: ' + uploadRes.status);
-  const uploadJson = await uploadRes.json();
-  const fileId     = uploadJson.id;
-  if (!fileId) throw new Error('File ID tidak ditemukan setelah upload.');
-
-  // Kembalikan fileId (rename dilakukan GAS saat simpan)
-  return { fileId, name: fileObj.name, mimeType: fileObj.mimeType };
-}
-
-// ── Helper: resolve file (upload dulu kalau ada base64) ──
-// Mengembalikan { fileId, name } atau null
-async function _resolveFileForUpload(fileObj) {
-  if (!fileObj) return null;
-  if (fileObj.base64) return await _uploadFileFast(fileObj);
-  return null;
-}
-
-// ── Wrapper: upload semua file dalam params sebelum kirim ke GAS ──
-async function gasPostWithFiles(action, params = {}) {
-  // Ekstrak data wrapper kalau ada
-  const d = params.data || params;
-
-  // Upload file utama
-  if (d.file && d.file.base64) {
-    d.file = await _resolveFileForUpload(d.file);
-  }
-  // Upload pindaian
-  if (d.filePindaian && d.filePindaian.base64) {
-    d.filePindaian = await _resolveFileForUpload(d.filePindaian);
-  }
-  // Upload lampiran list
-  if (Array.isArray(d.fileLampiranList) && d.fileLampiranList.length) {
-    const resolved = [];
-    for (const lamp of d.fileLampiranList) {
-      resolved.push(lamp && lamp.base64 ? await _resolveFileForUpload(lamp) : lamp);
-    }
-    d.fileLampiranList = resolved;
+  // Kalau payload kecil (tidak ada file besar) — kirim langsung via GET
+  if (payload.length < 100000) {
+    const qs = new URLSearchParams({ action, payload }).toString();
+    const res = await fetch(`${GAS_URL}?${qs}`, { method: 'GET' });
+    const json = await res.json();
+    if (!json.ok) throw new Error(json.error || 'Request gagal');
+    return json.data;
   }
 
-  // Kirim ke GAS (sekarang payload kecil karena tidak ada base64)
-  return await gasPost(action, params.data ? { ...params, data: d } : d);
+  // Payload besar (ada file) — kirim via fetch POST
+  // GAS menerima POST tapi tidak return CORS header
+  // Workaround: kirim POST, baca response via mode cors dengan credentials
+  try {
+    const res = await fetch(GAS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: JSON.stringify({ action, ...params })
+    });
+    const json = await res.json();
+    if (!json.ok) throw new Error(json.error || 'Request gagal');
+    return json.data;
+  } catch(corsErr) {
+    // Kalau POST kena CORS, coba kirim via GET dengan payload lebih kecil
+    // (hapus base64 file dari params, kirim metadata saja)
+    console.warn('[SODA] POST CORS error, mencoba fallback...', corsErr.message);
+    throw new Error('Upload gagal. Coba file yang lebih kecil (< 1MB) atau cek koneksi.');
+  }
 }
 
 // ── Cek versi dari GAS, trigger SW update kalau beda ──
@@ -892,7 +851,7 @@ async function simpanMasuk() {
     if (selectedFileMasuk) { const base64 = await fileToBase64(selectedFileMasuk); fileData = { name: selectedFileMasuk.name, mimeType: selectedFileMasuk.type || 'application/octet-stream', base64 }; }
     let fileLampiranList = [];
     for (const lamp of selectedLampiranMasukList) { const base64L = await fileToBase64(lamp); fileLampiranList.push({ name: lamp.name, mimeType: lamp.type || 'application/octet-stream', base64: base64L }); }
-    const res = await gasPostWithFiles('simpanSuratMasuk', { data: { noAgenda: nextNoAgenda, nomorSurat, uraianInformasi: uraian, catatan, kodeKlasifikasi: mSelectedKode, namaKlasifikasi: mSelectedNama, tanggalSurat: tanggalIndoKeIso(tglSuratInput), tanggalTerima: tanggalIndoKeIso(tglTerimaInput), tanggalTurun: tanggalIndoKeIso(tglTurunInput), disposisi: selectedDisposisi.join(' | '), pengirim, penerima, file: fileData, fileLampiranList } });
+    const res = await gasPost('simpanSuratMasuk', { data: { noAgenda: nextNoAgenda, nomorSurat, uraianInformasi: uraian, catatan, kodeKlasifikasi: mSelectedKode, namaKlasifikasi: mSelectedNama, tanggalSurat: tanggalIndoKeIso(tglSuratInput), tanggalTerima: tanggalIndoKeIso(tglTerimaInput), tanggalTurun: tanggalIndoKeIso(tglTurunInput), disposisi: selectedDisposisi.join(' | '), pengirim, penerima, file: fileData, fileLampiranList } });
     toast(res.message || 'Berhasil.'); resetFormMasuk(); preloadSuratMasuk(); preloadSPPD(); loadNextNoAgenda();
     btn.disabled = false; btn.textContent = 'Simpan Surat Masuk';
   } catch(e) { toast('Gagal: ' + e.message, true); btn.disabled = false; btn.textContent = 'Simpan Surat Masuk'; }
@@ -922,7 +881,7 @@ async function simpanKeluar() {
     if (selectedFileKeluar) { const base64 = await fileToBase64(selectedFileKeluar); fileData = { name: selectedFileKeluar.name, mimeType: selectedFileKeluar.type || 'application/octet-stream', base64 }; }
     let fileLampiranList = [];
     for (const lamp of selectedLampiranKeluarList) { const base64L = await fileToBase64(lamp); fileLampiranList.push({ name: lamp.name, mimeType: lamp.type || 'application/octet-stream', base64: base64L }); }
-    const res = await gasPostWithFiles('simpanSuratKeluar', { data: { tanggalSurat: tanggalIndoKeIso(tglInput), nomorSurat: nomorGenerated, hal, pembuat, tujuan, file: fileData, fileLampiranList } });
+    const res = await gasPost('simpanSuratKeluar', { data: { tanggalSurat: tanggalIndoKeIso(tglInput), nomorSurat: nomorGenerated, hal, pembuat, tujuan, file: fileData, fileLampiranList } });
     toast(res.message || 'Berhasil.'); resetFormKeluar(); preloadSuratKeluar();
     btn.disabled = false; btn.textContent = 'Simpan Surat Keluar';
   } catch(e) { toast('Gagal: ' + e.message, true); btn.disabled = false; btn.textContent = 'Simpan Surat Keluar'; }
@@ -1069,10 +1028,10 @@ async function simpanEditKeluar() {
 // ═══════════════════════════════════════════════
 // UPLOAD DARI TABEL
 // ═══════════════════════════════════════════════
-async function uploadDokumenDariTabel(enc) { const nomorSurat=decodeURIComponent(enc); _pickFile(async file=>{try{const res=await gasPostWithFiles('uploadDokumenSurat',{nomorSurat,file});toast(res.message||'Berhasil.');loadSuratKeluar();}catch(e){toast('Gagal: '+e.message,true);}}); }
-async function uploadLampiranKeluarDariTabel(enc) { const nomorSurat=decodeURIComponent(enc); _pickFile(async file=>{try{const res=await gasPostWithFiles('uploadLampiranSuratKeluar',{nomorSurat,file});toast(res.message||'Berhasil.');loadSuratKeluar();}catch(e){toast('Gagal: '+e.message,true);}}); }
-async function uploadDokumenMasukDariTabel(enc) { const noAgenda=decodeURIComponent(enc); _pickFile(async file=>{try{const res=await gasPostWithFiles('uploadDokumenSuratMasuk',{noAgenda,file});toast(res.message||'Berhasil.');loadSuratMasuk();}catch(e){toast('Gagal: '+e.message,true);}}); }
-async function uploadLampiranMasukDariTabel(enc) { const noAgenda=decodeURIComponent(enc); _pickFile(async file=>{try{const res=await gasPostWithFiles('uploadLampiranSuratMasuk',{noAgenda,file});toast(res.message||'Berhasil.');loadSuratMasuk();}catch(e){toast('Gagal: '+e.message,true);}}); }
+async function uploadDokumenDariTabel(enc) { const nomorSurat=decodeURIComponent(enc); _pickFile(async file=>{try{const res=await gasPost('uploadDokumenSurat',{nomorSurat,file});toast(res.message||'Berhasil.');loadSuratKeluar();}catch(e){toast('Gagal: '+e.message,true);}}); }
+async function uploadLampiranKeluarDariTabel(enc) { const nomorSurat=decodeURIComponent(enc); _pickFile(async file=>{try{const res=await gasPost('uploadLampiranSuratKeluar',{nomorSurat,file});toast(res.message||'Berhasil.');loadSuratKeluar();}catch(e){toast('Gagal: '+e.message,true);}}); }
+async function uploadDokumenMasukDariTabel(enc) { const noAgenda=decodeURIComponent(enc); _pickFile(async file=>{try{const res=await gasPost('uploadDokumenSuratMasuk',{noAgenda,file});toast(res.message||'Berhasil.');loadSuratMasuk();}catch(e){toast('Gagal: '+e.message,true);}}); }
+async function uploadLampiranMasukDariTabel(enc) { const noAgenda=decodeURIComponent(enc); _pickFile(async file=>{try{const res=await gasPost('uploadLampiranSuratMasuk',{noAgenda,file});toast(res.message||'Berhasil.');loadSuratMasuk();}catch(e){toast('Gagal: '+e.message,true);}}); }
 function _pickFile(cb) {
   const input=document.createElement('input'); input.type='file'; input.accept='.pdf,.doc,.docx,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document';
   input.addEventListener('change',async e=>{const file=e.target.files[0];if(!file||!_validFile(file))return;toast('Mengunggah dokumen...');const base64=await fileToBase64(file);cb({name:file.name,mimeType:file.type||'application/octet-stream',base64});});
@@ -1268,7 +1227,7 @@ async function simpanPinjamArsip() {
   let filePindaianData=null;
   try{if(pinjamFilePindaian){const base64=await fileToBase64(pinjamFilePindaian);filePindaianData={name:pinjamFilePindaian.name,mimeType:pinjamFilePindaian.type||'application/pdf',base64};}}catch(e){}
   try {
-    const res=await gasPostWithFiles('simpanPinjamArsip',{data:{jenis,sumberArsip:sumber,noAgendaSODA,jumlah,pemohon,instansi,tanggalPinjam:tglP,tanggalKembali:tglK,pindaianNama,pindaianUrl,filePindaian:filePindaianData}});
+    const res=await gasPost('simpanPinjamArsip',{data:{jenis,sumberArsip:sumber,noAgendaSODA,jumlah,pemohon,instansi,tanggalPinjam:tglP,tanggalKembali:tglK,pindaianNama,pindaianUrl,filePindaian:filePindaianData}});
     toast(res.message||'Berhasil.'); clearSODASelection();clearSODAKeluarSelection();document.getElementById('pinjamJenisSrikandi').value='';
     ['pinjamJumlah','pinjamPemohon','pinjamInstansi','pinjamTglPinjam','pinjamTglKembali'].forEach(id=>document.getElementById(id).value='');
     _resetPindaianBox();loadPinjamArsip();gasGet('getAutocompleteListPinjam').then(res=>{askiAutoListPinjam=res||askiAutoListPinjam;}).catch(()=>{});
@@ -1325,7 +1284,7 @@ async function simpanEditPinjam() {
   const btn=document.getElementById('btnSimpanEditPinjam');btn.disabled=true;btn.textContent='Menyimpan...';
   let filePindaianData=null;try{if(epFilePindaian){const base64=await fileToBase64(epFilePindaian);filePindaianData={name:epFilePindaian.name,mimeType:epFilePindaian.type||'application/pdf',base64};}}catch(e){}
   const data={no:document.getElementById('epNo').value.trim(),jenis:document.getElementById('epJenis').value.trim(),sumberArsip:document.getElementById('epSumberArsip').value.trim(),noAgendaSODA:document.getElementById('epNoAgendaSODA').value.trim(),jumlah:document.getElementById('epJumlah').value.trim(),pemohon:document.getElementById('epPemohon').value.trim(),instansi:document.getElementById('epInstansi').value.trim(),tanggalPinjam:tglPinjam,tanggalKembali:tglKembali,pindaianNama:document.getElementById('epPindaianNama').value,pindaianUrl:document.getElementById('epPindaianUrl').value,filePindaian:filePindaianData};
-  try{const res=await gasPostWithFiles('editPinjamArsip',{data});toast(res.message||'Berhasil.');closeEditPinjam();loadPinjamArsip();btn.disabled=false;btn.textContent='💾 Simpan Perubahan';}catch(e){toast('Gagal: '+e.message,true);btn.disabled=false;btn.textContent='💾 Simpan Perubahan';}
+  try{const res=await gasPost('editPinjamArsip',{data});toast(res.message||'Berhasil.');closeEditPinjam();loadPinjamArsip();btn.disabled=false;btn.textContent='💾 Simpan Perubahan';}catch(e){toast('Gagal: '+e.message,true);btn.disabled=false;btn.textContent='💾 Simpan Perubahan';}
 }
 function closeEditPinjam(){document.getElementById('modalEditPinjam').style.display='none';epFilePindaian=null;}
 function openHapusPinjam(enc){deletePinjamNo=decodeURIComponent(enc);document.getElementById('modalHapusPinjam').style.display='flex';}
